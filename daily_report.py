@@ -155,19 +155,21 @@ def get_first_link(work: dict) -> str:
     return ""
 
 
-def get_pdf_url(work: dict) -> str:
-    """尝试获取论文 PDF 链接"""
+def get_pdf_candidates(work: dict) -> list[str]:
+    """尝试获取论文 PDF 链接列表（按优先级）"""
+    candidates = []
+
     # arXiv
     arxiv_id = work.get("arxiv_id")
     if arxiv_id:
-        return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+        candidates.append(f"https://arxiv.org/pdf/{arxiv_id}.pdf")
 
     # OpenAlex OA PDF
     for loc_key in ["best_oa_location", "primary_location"]:
         loc = work.get(loc_key, {}) or {}
         pdf_url = (loc.get("pdf_url") or "").strip()
-        if pdf_url:
-            return pdf_url
+        if pdf_url and pdf_url not in candidates:
+            candidates.append(pdf_url)
 
     # DOI via Unpaywall
     doi = work.get("doi", "")
@@ -180,11 +182,32 @@ def get_pdf_url(work: dict) -> str:
                 data = r.json()
                 best = data.get("best_oa_location", {}) or {}
                 pdf = best.get("url_for_pdf") or ""
-                if pdf:
-                    return pdf
+                if pdf and pdf not in candidates:
+                    candidates.append(pdf)
         except Exception:
             pass
-    return ""
+
+    # 对已知出版商生成备用链接
+    expanded = []
+    for url in candidates:
+        expanded.append(url)
+        # MDPI: 去掉 version 参数
+        if "mdpi.com" in url and "?version=" in url:
+            expanded.append(url.split("?version=")[0])
+    # 去重保持顺序
+    seen = set()
+    final = []
+    for u in expanded:
+        if u not in seen:
+            seen.add(u)
+            final.append(u)
+    return final
+
+
+def get_pdf_url(work: dict) -> str:
+    """兼容旧接口：返回第一个 PDF 候选链接"""
+    cands = get_pdf_candidates(work)
+    return cands[0] if cands else ""
 
 
 def get_journal_score(work: dict) -> tuple[int, str]:
@@ -254,7 +277,7 @@ def search_openalex(query: str, per_page: int = 12) -> list[dict]:
         "search": query,
         "per_page": per_page,
         "sort": "publication_date:desc",
-        "select": "id,doi,title,authorships,publication_date,publication_year,cited_by_count,primary_location,best_oa_location,open_access,abstract_inverted_index,type",
+        "select": "id,doi,title,authorships,publication_date,publication_year,cited_by_count,primary_location,best_oa_location,open_access,abstract_inverted_index,type,ids",
         "filter": "from_publication_date:2023-01-01",
     }
     try:
@@ -264,6 +287,12 @@ def search_openalex(query: str, per_page: int = 12) -> list[dict]:
         results = data.get("results", [])
         for r in results:
             r["source"] = "openalex"
+            # 尝试从 ids 字段提取 arXiv ID
+            ids = r.get("ids") or {}
+            if isinstance(ids, dict):
+                arxiv_url = ids.get("arxiv") or ""
+                if arxiv_url:
+                    r["arxiv_id"] = arxiv_url.split("/")[-1].strip()
         return results
     except Exception as e:
         print(f"  [WARN] OpenAlex 搜索失败 ({query[:30]}...): {e}")
@@ -272,12 +301,25 @@ def search_openalex(query: str, per_page: int = 12) -> list[dict]:
 
 # ── API 搜索: arXiv ──
 
-def search_arxiv(query: str, max_results: int = 10) -> list[dict]:
+# 中文查询到英文的映射，用于 arXiv 搜索
+CN_TO_EN = {
+    "电力预测 深度学习": "electricity load forecasting deep learning",
+    "尖峰电价 预测": "electricity price spike forecasting",
+    "负电价 电力市场": "negative electricity price market",
+    "电价波动 电力市场 预测": "electricity price volatility forecasting",
+}
+
+
+def search_arxiv(query: str, max_results: int = 15) -> list[dict]:
+    # 中文查询尝试映射为英文后再搜索 arXiv
     if any("\u4e00" <= ch <= "\u9fff" for ch in query):
-        return []
+        query = CN_TO_EN.get(query, "")
+        if not query:
+            return []
     url = "http://export.arxiv.org/api/query"
+    # 使用 title/abstract 精确匹配，限制在机器学习/AI/统计相关分类，减少无关结果
     params = {
-        "search_query": f"all:{query}",
+        "search_query": f"(ti:{query} OR abs:{query}) AND (cat:cs.LG OR cat:cs.AI OR cat:stat.ML OR cat:eess.SY)",
         "start": 0,
         "max_results": max_results,
         "sortBy": "submittedDate",
@@ -387,21 +429,84 @@ def score_paper(work: dict) -> tuple[float, str]:
     keywords_found = sum(1 for t in relevance_terms if t in title or t in abstract_text)
     relevance_score = min(keywords_found * 3, 20)
 
-    total = time_score + journal_score + cite_score + relevance_score
-    details = f"时间{time_score} + 期刊{journal_score} + 引用{cite_score} + 相关{relevance_score} = {total}"
+    # 优先选择可获取全文的论文（有图有公式）
+    open_access_score = 0
+    is_arxiv = bool(work.get("arxiv_id"))
+    if is_arxiv:
+        open_access_score += 35
+    else:
+        # 检查 OpenAlex 是否有 OA PDF，不调用外部 API
+        has_oa_pdf = False
+        for loc_key in ["best_oa_location", "primary_location"]:
+            loc = work.get(loc_key, {}) or {}
+            if (loc.get("pdf_url") or "").strip():
+                has_oa_pdf = True
+                break
+        if has_oa_pdf:
+            open_access_score += 15
+
+    # arXiv 论文如果相关度高，额外奖励，使其更容易进入 TOP10 并被选中
+    arxiv_bonus = 0
+    if is_arxiv and relevance_score >= 6:
+        arxiv_bonus = 20
+
+    total = time_score + journal_score + cite_score + relevance_score + open_access_score + arxiv_bonus
+
+    # 相关性门槛：与电力预测不相关的论文直接降权
+    if relevance_score < 6:
+        total = int(total * 0.3)
+
+    details = f"时间{time_score} + 期刊{journal_score} + 引用{cite_score} + 相关{relevance_score} + 可获取{open_access_score} + arXiv奖励{arxiv_bonus} = {total}"
     return total, details
 
 
 # ── PDF / LaTeX 下载与解析 ──
 
-def safe_download(url: str, path: Path, timeout: int = 60) -> bool:
+def safe_download(url: str, path: Path, timeout: int = 60, headers: dict | None = None, landing_page: str | None = None) -> bool:
+    """带反爬策略的下载：使用 session、先访问 landing page 获取 cookie、加 referer"""
     try:
         print(f"    [下载] {url[:70]}...")
-        r = requests.get(url, timeout=timeout, stream=True)
+        session = requests.Session()
+        default_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "application/pdf,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": landing_page or "https://www.google.com/",
+        }
+        if headers:
+            default_headers.update(headers)
+
+        # 对需要 cookie 的站点（如 MDPI、Elsevier），先访问 landing page
+        if not landing_page:
+            if "mdpi.com" in url:
+                landing_page = url.replace("/pdf", "").split("?")[0]
+            elif "sciencedirect.com" in url:
+                landing_page = url.replace("/article/pii/", "/article/pii/")  # 保持原样
+            elif "springer.com" in url:
+                landing_page = url.replace("/content/pdf/", "/article/")
+            elif "ieeexplore.ieee.org" in url:
+                landing_page = url.replace("/stamp/stamp.jsp?tp=&arnumber=", "/document/")
+
+        if landing_page:
+            try:
+                session.get(landing_page, headers=default_headers, timeout=timeout)
+            except Exception:
+                pass
+
+        r = session.get(url, headers=default_headers, timeout=timeout, stream=True)
         r.raise_for_status()
+        # 简单检查内容类型，避免下载到 HTML 错误页
+        content_type = r.headers.get("Content-Type", "").lower()
+        if "html" in content_type and "pdf" not in content_type:
+            print(f"    [FAIL] 下载到 HTML 页面而非 PDF")
+            return False
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
+        # 检查文件大小，避免空文件
+        if path.stat().st_size < 1024:
+            print(f"    [FAIL] 文件过小，可能下载失败")
+            return False
         return True
     except Exception as e:
         print(f"    [FAIL] 下载失败: {e}")
@@ -428,14 +533,14 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
 
 
 def extract_images_from_pdf(pdf_path: Path, output_dir: Path, prefix: str) -> list[Path]:
-    """用 PyMuPDF 提取 PDF 中的图片对象"""
+    """用 PyMuPDF 提取 PDF 中的图片对象，优先保留靠前的、面积大的图（通常是流程图）"""
     try:
         import fitz
     except ImportError:
         return []
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
+    candidates = []
     try:
         doc = fitz.open(str(pdf_path))
         seen = set()
@@ -458,21 +563,34 @@ def extract_images_from_pdf(pdf_path: Path, output_dir: Path, prefix: str) -> li
                     img_path = output_dir / filename
                     with open(img_path, "wb") as f:
                         f.write(image_bytes)
-                    # 过滤太小的图（可能是图标）
-                    if img_path.stat().st_size < 2048:
+                    size = img_path.stat().st_size
+                    # 过滤太小的图（图标）
+                    if size < 4096:
                         img_path.unlink()
                         continue
-                    saved.append(img_path)
-                    if len(saved) >= MAX_IMAGES_PER_PAPER:
-                        break
+                    # 记录页码、面积近似值（宽*高）和路径
+                    width = img.get(2, 0) or 0
+                    height = img.get(3, 0) or 0
+                    area = width * height
+                    candidates.append({"path": img_path, "page": page_idx, "area": area, "size": size})
                 except Exception:
                     continue
-            if len(saved) >= MAX_IMAGES_PER_PAPER:
-                break
         doc.close()
+
+        # 排序：页码越靠前、面积越大越优先（流程图通常在前几页且较大）
+        candidates.sort(key=lambda x: (x["page"], -x["area"]))
+        saved = [c["path"] for c in candidates[:MAX_IMAGES_PER_PAPER]]
+
+        # 删除未入选的临时文件
+        for c in candidates[MAX_IMAGES_PER_PAPER:]:
+            try:
+                c["path"].unlink()
+            except Exception:
+                pass
+        return saved
     except Exception as e:
         print(f"    [WARN] PDF 图片提取失败: {e}")
-    return saved
+    return []
 
 
 def find_main_tex(extract_dir: Path) -> Path | None:
@@ -566,12 +684,21 @@ def download_arxiv_source(arxiv_id: str, output_dir: Path) -> Path | None:
 
 
 def collect_source_images(extract_dir: Path) -> list[Path]:
-    """收集 LaTeX 源文件中的图片"""
+    """收集 LaTeX 源文件中的图片，优先选流程图/架构图"""
     images = []
-    for ext in ["*.png", "*.jpg", "*.jpeg", "*.pdf"]:
+    for ext in ["*.png", "*.jpg", "*.jpeg"]:
         images.extend(extract_dir.rglob(ext))
-    # 优先选文件名包含 figure 的
-    images.sort(key=lambda p: ("figure" not in p.name.lower(), p.name))
+
+    # 优先关键词：流程图、架构图通常在前面的 figure
+    priority_keywords = ["overview", "framework", "architecture", "model", "pipeline", "schematic"]
+
+    def sort_key(p: Path) -> tuple:
+        name = p.name.lower()
+        has_priority = any(k in name for k in priority_keywords)
+        # 优先含关键词的，其次按文件名（figure 1 通常排在前面）
+        return (0 if has_priority else 1, p.name)
+
+    images.sort(key=sort_key)
     return images[:MAX_IMAGES_PER_PAPER]
 
 
@@ -679,21 +806,24 @@ def enrich_paper(work: dict) -> dict:
                 if result["full_text"]:
                     result["parse_status"] = "pdf"
     else:
-        # 非 arXiv：尝试 OA PDF
-        pdf_url = get_pdf_url(work)
-        if pdf_url:
+        # 非 arXiv：尝试多个 OA PDF 候选链接
+        candidates = get_pdf_candidates(work)
+        landing_page = get_first_link(work)
+        if candidates:
             pdf_path = paper_dir / f"{slugify(work.get('id','paper'))}.pdf"
-            if safe_download(pdf_url, pdf_path):
-                result["full_text"] = extract_text_from_pdf(pdf_path)
-                imgs = extract_images_from_pdf(pdf_path, assets_subdir, slugify(work.get("id", "paper")))
-                for img in imgs:
-                    result["images"].append({
-                        "path": img,
-                        "url": "",
-                        "caption": img.name,
-                    })
-                if result["full_text"]:
-                    result["parse_status"] = "pdf"
+            for pdf_url in candidates:
+                if safe_download(pdf_url, pdf_path, landing_page=landing_page):
+                    result["full_text"] = extract_text_from_pdf(pdf_path)
+                    imgs = extract_images_from_pdf(pdf_path, assets_subdir, slugify(work.get("id", "paper")))
+                    for img in imgs:
+                        result["images"].append({
+                            "path": img,
+                            "url": "",
+                            "caption": img.name,
+                        })
+                    if result["full_text"]:
+                        result["parse_status"] = "pdf"
+                        break
 
     return result
 
@@ -748,44 +878,73 @@ def build_paper_card(rank: int, work: dict, score: float, details: str, enrich: 
     }
 
 
-def generate_article(top10: list[tuple[float, dict, str, dict]]) -> str:
+def generate_single_article(selected: tuple[float, dict, str, dict], top10: list[tuple[float, dict, str, dict]], enrich: dict) -> str:
+    """生成单篇精选论文的公众号风格深度解读文章"""
     today = today_str()
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_cn().weekday()]
 
-    top3_cards = [build_paper_card(i + 1, w, s, d, e) for i, (s, w, d, e) in enumerate(top10[:3])]
-    other7_cards = [build_paper_card(i + 4, w, s, d, e) for i, (s, w, d, e) in enumerate(top10[3:10])]
+    s, w, d = selected
+    card = build_paper_card(1, w, s, d, enrich)
 
-    prompt = f"""你是一位专注能源人工智能的资深科技编辑，正在为公众号撰写一期深度版「电力预测科研日报 v2.0」。
-请严格基于下面真实的论文数据（含全文/公式/图表），撰写一篇专业、深入、有可读性的 Markdown 文章。
+    # TOP10 列表只做附加重量信息，不展开
+    top10_list = []
+    for i, (ss, ww, dd) in enumerate(top10, 1):
+        top10_list.append({
+            "rank": i,
+            "title": ww.get("title", "未知标题"),
+            "link": get_first_link(ww),
+            "score": ss,
+        })
+
+    prompt = f"""你是一位专注能源人工智能与电力系统的资深科技编辑，正在为微信公众号撰写「电力预测科研日报 v2.0」。
+今天只从 TOP10 候选中精选 **一篇** 论文做深度解读。请基于下面真实的论文数据（含全文/公式/图表），撰写一篇专业、通俗、有视觉冲击力的 Markdown 文章。
 
 今日日期：{today} {weekday_cn}
 
-## 输出要求
-1. 标题吸睛，包含日期和主题，例如「{today} 电力预测深度日报 | ...」。
-2. 开头写 300 字行业导语，概括今日论文整体趋势、方法热点、实验发现。
-3. TOP 3 论文每篇单独成节，深度解读：
-   - **研究背景与问题**：这篇论文解决什么痛点
-   - **方法框架**：用通俗语言讲解核心模型/方法，配「方法图说明」（如果有图片）
-   - **核心公式讲解**：对提供的 LaTeX 公式，解释每个符号含义、公式在解决什么问题（没有公式则跳过）
-   - **实验结果**：解读实验结果图/表格说明，提炼关键数字
-   - **一句话 takeaway**
-   - 必须保留可点击链接：`[论文链接](url)`
-   - 图片引用格式：`![图注](image_url)`
-   - 公式用 LaTeX 块：$$...$$
-4. 其余 7 篇用「一句话短评 + 链接」列表展示。
-5. 结尾给出 3 条「今日研究启发」。
-6. 全文用 Markdown，可直接复制到公众号编辑器。
+## 你的工作流程（请严格执行）
 
-## TOP 3 论文（含全文/公式/图片）
-{json.dumps(top3_cards, ensure_ascii=False, indent=2)}
+1. **先看图**：从论文数据里的 `images` 列表中找到论文开头的**总流程图/总体架构图**（通常是 Figure 1、Architecture、Framework、Overview、Pipeline 那张，不要搞错成局部小图）。
+2. **再看公式**：从 `formulas` 列表中挑选 2-4 个**最核心的数学公式**（通常是目标函数、模型关键方程、损失函数等）。
+3. **然后写文章**：按下面两大部分组织，第一部分围绕总流程图讲创新点+实验效果，第二部分围绕公式讲方法细节。
 
-## 其余 7 篇论文
-{json.dumps(other7_cards, ensure_ascii=False, indent=2)}
+## 输出结构（必须严格按以下两部分组织）
+
+### 第一部分：文章摘要与创新点（结合总流程图）
+- 先用 100 字左右的「导语」点明这篇论文为什么值得关注。
+- 用 400-600 字介绍这篇论文要解决的核心问题、核心创新点。
+- **重点结合论文开头的总流程图**（Figure 1 / Architecture / Framework / Overview）进行讲解：
+  - 先插入该图：`![图注](image_url)`，图注要具体说明这张图展示了什么。
+  - 描述图中每个主要模块的作用、输入输出、数据流向。
+  - 这张图如何体现论文的核心思路？
+- 与传统方法相比，这个工作的突破在哪里？
+- 结合实验结果，给出关键性能数字（如 MAPE、RMSE、R²、MAE 等），说明效果有多好。如果有实验结果图，也插入并解读关键趋势。
+
+### 第二部分：详细方法讲解（结合公式）
+- 深入讲解核心方法，必须结合提供的 LaTeX 公式。
+- **对每个公式**：
+  - 先写出 LaTeX 公式块（使用 `$$...$$`）。
+  - 再逐行/逐符号解释：这个符号代表什么？这个公式在解决什么问题？为什么这样设计？
+  - 用通俗语言讲解，让非专业读者也能理解核心思想。
+- 如果有实验结果图，解读图中关键信息：哪条线代表什么？趋势说明了什么？
+
+## 排版与格式要求
+1. 标题吸睛，包含日期和主题，例如「{today} 电力预测深度日报 | ......」。
+2. 图片引用格式：`![图注](image_url)`，图注要具体说明这张图展示了什么。**只能从 `images` 列表中选取真实存在的图片 URL 进行引用，禁止引用列表之外的图片，禁止编造任何图片或图片 URL。如果 `images` 列表为空，必须在文中明确说明“论文未提供可解析的图表”。**
+3. 公式格式：用 `$$...$$` LaTeX 块，公式后面紧跟「公式解读」。**如果 `formulas` 列表为空，禁止编造公式，必须说明“论文未提供可解析的数学公式”。**
+4. 必须保留可点击论文链接：`[论文链接](url)`。
+5. 结尾给出「一句话 takeaway」和「为什么今天读这篇？」。
+6. 全文 Markdown，可直接复制到公众号编辑器。
+
+## 今日精选论文（含全文/公式/图片）
+{json.dumps(card, ensure_ascii=False, indent=2)}
+
+## 今日 TOP10 候选列表（仅参考，不要展开写）
+{json.dumps(top10_list, ensure_ascii=False, indent=2)}
 
 请直接输出文章正文，不要输出"好的"等额外说明。
 """
 
-    return llm_chat([{"role": "user", "content": prompt}], max_tokens=8000)
+    return llm_chat([{"role": "user", "content": prompt}], max_tokens=10000)
 
 
 # ── 通知推送抽象层 ──
@@ -1051,23 +1210,41 @@ def main():
         print(f"  {i:2d}. [{s:.0f}分] {title}")
         print(f"      期刊:{jname} | {d}")
 
-    print(f"\n[Step 3/6] 下载并解析 TOP 3 论文全文/图表/公式...")
+    print(f"\n[Step 3/6] 下载并解析今日精选论文（TOP10 中优先选能拿到全文/图表/公式的）...")
     repo = os.getenv(GITHUB_REPO_ENV, "")
     token = os.getenv(GITHUB_TOKEN_ENV, "")
-    enriched_top10 = []
+
+    # 从 TOP10 中依次尝试，优先选择能解析出全文、图片或公式的论文
+    selected = None
+    enrich = None
     for rank, (s, w, d) in enumerate(top10, 1):
-        print(f"\n  [{rank}/10] {w.get('title', '未知')[:50]}...")
+        print(f"\n  [候选 TOP{rank}] {w.get('title', '未知')[:60]}...")
+        print(f"       评分详情: {d}")
         enrich = enrich_paper(w)
         # 上传图片
         for img in enrich.get("images", []):
             img["url"] = get_image_public_url(img["path"], repo if repo else None, token if token else None)
-        enriched_top10.append((s, w, d, enrich))
-        print(f"      解析状态: {enrich['parse_status']}, 文本 {len(enrich['full_text'])} 字, "
+        print(f"       解析状态: {enrich['parse_status']}, 文本 {len(enrich['full_text'])} 字, "
               f"图片 {len(enrich['images'])}, 公式 {len(enrich['formulas'])}")
+        if enrich["parse_status"] != "abstract_only":
+            selected = (s, w, d)
+            print(f"  [OK] 选定 TOP{rank} 作为今日精选（可解析）")
+            break
+        else:
+            print(f"  [WARN] TOP{rank} 无法获取全文，尝试下一篇...")
 
-    print(f"\n[Step 4/6] 用 LLM 生成深度解读文章...")
+    if selected is None:
+        # 全部无法解析，fallback 到 TOP1
+        selected = top10[0]
+        s, w, d = selected
+        print(f"\n  [WARN] TOP10 均无法获取全文，fallback 到 TOP1: {w.get('title', '未知')[:60]}...")
+        enrich = enrich_paper(w)
+        for img in enrich.get("images", []):
+            img["url"] = get_image_public_url(img["path"], repo if repo else None, token if token else None)
+
+    print(f"\n[Step 4/6] 用 LLM 生成单篇深度解读文章...")
     try:
-        article = generate_article(enriched_top10)
+        article = generate_single_article(selected, top10, enrich)
     except Exception as e:
         print(f"\n[失败] LLM 生成失败: {e}")
         return
@@ -1076,7 +1253,7 @@ def main():
     filepath = save_report(article)
 
     print(f"\n[Step 6/6] 推送通知...")
-    title = "电力预测科研日报 v2.0"
+    title = f"电力预测科研日报 v2.0 | {today_str()}"
     send_notification(title, article)
 
     print(f"\n{'='*60}")
