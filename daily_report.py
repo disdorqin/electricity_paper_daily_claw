@@ -617,27 +617,46 @@ def extract_formulas_from_tex(tex_path: Path) -> list[dict]:
         return []
 
     formulas = []
-    # 匹配 \begin{equation} ... \end{equation}
-    for m in re.finditer(r"\\begin\{equation\}\*?(.*?)\\end\{equation\}", text, re.DOTALL):
+
+    # 1) 匹配各类公式环境
+    envs = ["equation", "equation*", "align", "align*", "gather", "gather*",
+            "multline", "multline*", "eqnarray", "eqnarray*", "flalign", "flalign*"]
+    for env in envs:
+        pattern = rf"\\begin\{{{re.escape(env)}\}}(.*?)\\end\{{{re.escape(env)}\}}"
+        for m in re.finditer(pattern, text, re.DOTALL):
+            body = m.group(1).strip()
+            if body and len(body) > 5:
+                formulas.append({"type": env.replace("*", ""), "latex": body})
+
+    # 2) 匹配 $$...$$
+    for m in re.finditer(r"\$\$(.*?)\$\$", text, re.DOTALL):
         body = m.group(1).strip()
         if body and len(body) > 5:
-            formulas.append({"type": "equation", "latex": body})
-    # 匹配 \[ ... \]
+            formulas.append({"type": "display", "latex": body})
+
+    # 3) 匹配 \\[ ... \\]
     for m in re.finditer(r"\\\[(.*?)\\\]", text, re.DOTALL):
         body = m.group(1).strip()
         if body and len(body) > 5:
             formulas.append({"type": "display", "latex": body})
-    # 去重并限制数量
+
+    # 4) 匹配行内 $...$（至少包含一个等号或常见数学符号，过滤掉单个变量）
+    inline_pattern = re.compile(r"(?<!\$)\$([^$\n]{5,200})\$(?!\$)")
+    for m in inline_pattern.finditer(text):
+        body = m.group(1).strip()
+        if re.search(r"[=+\-*/^_\\{}\\[\\]\\(\\)]", body):
+            formulas.append({"type": "inline", "latex": body})
+
+    # 去重并限制数量：优先保留较长的公式（更可能是核心公式）
     seen = set()
     unique = []
     for f in formulas:
-        key = f["latex"][:80]
+        key = f["latex"][:120]
         if key not in seen:
             seen.add(key)
             unique.append(f)
-        if len(unique) >= MAX_FORMULAS_PER_PAPER:
-            break
-    return unique
+    unique.sort(key=lambda x: -len(x["latex"]))
+    return unique[:MAX_FORMULAS_PER_PAPER]
 
 
 def extract_text_from_tex(tex_path: Path) -> str:
@@ -683,23 +702,63 @@ def download_arxiv_source(arxiv_id: str, output_dir: Path) -> Path | None:
     return None
 
 
-def collect_source_images(extract_dir: Path) -> list[Path]:
-    """收集 LaTeX 源文件中的图片，优先选流程图/架构图"""
-    images = []
+def collect_source_images(extract_dir: Path, tex_path: Path | None = None) -> list[tuple[Path, str, bool]]:
+    """收集 LaTeX 源文件中的图片，提取 caption，标记总流程图/架构图"""
+    images: list[Path] = []
     for ext in ["*.png", "*.jpg", "*.jpeg"]:
         images.extend(extract_dir.rglob(ext))
+
+    # 建立文件名 -> 图片路径映射
+    img_by_name: dict[str, Path] = {}
+    for img in images:
+        img_by_name[img.name.lower()] = img
+        # 也记录不带扩展名的名字
+        img_by_name[img.stem.lower()] = img
+
+    # 从主 tex 文件提取 figure 的 caption
+    captions: dict[str, str] = {}
+    is_framework: dict[str, bool] = {}
+    if tex_path and tex_path.exists():
+        try:
+            text = tex_path.read_text(encoding="utf-8", errors="ignore")
+            # 匹配 figure 环境（包括 figure*）
+            for fig_block in re.finditer(r"\\begin\{figure\*?\}(.*?)\\end\{figure\*?\}", text, re.DOTALL):
+                block = fig_block.group(1)
+                # 提取 caption
+                cap_match = re.search(r"\\caption\{(.*?)\}(?=\\label|\\end|\n)", block, re.DOTALL)
+                caption = cap_match.group(1).strip().replace("\n", " ") if cap_match else ""
+                # 提取 includegraphics 的图片文件名
+                for inc in re.finditer(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", block):
+                    raw_path = inc.group(1).strip()
+                    # 去掉扩展名进行匹配
+                    stem = Path(raw_path).stem.lower()
+                    name = Path(raw_path).name.lower()
+                    if stem in img_by_name:
+                        captions[img_by_name[stem].name.lower()] = caption
+                        is_framework[img_by_name[stem].name.lower()] = bool(
+                            re.search(r"overview|framework|architecture|pipeline|schematic|model structure|overall", caption, re.I)
+                        )
+                    if name in img_by_name:
+                        captions[img_by_name[name].name.lower()] = caption
+                        is_framework[img_by_name[name].name.lower()] = bool(
+                            re.search(r"overview|framework|architecture|pipeline|schematic|model structure|overall", caption, re.I)
+                        )
+        except Exception:
+            pass
 
     # 优先关键词：流程图、架构图通常在前面的 figure
     priority_keywords = ["overview", "framework", "architecture", "model", "pipeline", "schematic"]
 
     def sort_key(p: Path) -> tuple:
         name = p.name.lower()
-        has_priority = any(k in name for k in priority_keywords)
-        # 优先含关键词的，其次按文件名（figure 1 通常排在前面）
-        return (0 if has_priority else 1, p.name)
+        cap = captions.get(name, "").lower()
+        has_priority = any(k in name for k in priority_keywords) or any(k in cap for k in priority_keywords)
+        is_fw = is_framework.get(name, False)
+        # 总流程图优先，其次含关键词的，其次按文件名（figure 1 通常排在前面）
+        return (0 if is_fw else 1, 0 if has_priority else 1, p.name)
 
     images.sort(key=sort_key)
-    return images[:MAX_IMAGES_PER_PAPER]
+    return [(img, captions.get(img.name.lower(), img.name), is_framework.get(img.name.lower(), False)) for img in images[:MAX_IMAGES_PER_PAPER]]
 
 
 # ── GitHub 图床 ──
@@ -778,14 +837,15 @@ def enrich_paper(work: dict) -> dict:
             if tex_path:
                 result["full_text"] = extract_text_from_tex(tex_path)
                 result["formulas"] = extract_formulas_from_tex(tex_path)
-                imgs = collect_source_images(src_dir)
-                for img in imgs:
+                imgs = collect_source_images(src_dir, tex_path)
+                for img, caption, is_fw in imgs:
                     target = assets_subdir / f"{slugify(arxiv_id)}_{img.name}"
                     shutil.copy(img, target)
                     result["images"].append({
                         "path": target,
                         "url": "",
-                        "caption": img.name,
+                        "caption": caption,
+                        "is_framework": is_fw,
                     })
                 if result["full_text"] or result["formulas"]:
                     result["parse_status"] = "latex_source"
@@ -874,7 +934,7 @@ def build_paper_card(rank: int, work: dict, score: float, details: str, enrich: 
         "parse_status": enrich.get("parse_status", "abstract_only"),
         "full_text": enrich.get("full_text", ""),
         "formulas": enrich.get("formulas", []),
-        "images": [{"url": img.get("url", ""), "caption": img.get("caption", "")} for img in enrich.get("images", [])],
+        "images": [{"url": img.get("url", ""), "caption": img.get("caption", ""), "is_framework": img.get("is_framework", False)} for img in enrich.get("images", [])],
     }
 
 
@@ -903,7 +963,10 @@ def generate_single_article(selected: tuple[float, dict, str, dict], top10: list
 
 ## 你的工作流程（请严格执行）
 
-1. **先看图**：从论文数据里的 `images` 列表中找到论文开头的**总流程图/总体架构图**（通常是 Figure 1、Architecture、Framework、Overview、Pipeline 那张，不要搞错成局部小图）。
+1. **先看图**：从论文数据里的 `images` 列表中找到论文开头的**总流程图/总体架构图**。判断标准：
+   - 优先使用 `is_framework: true` 标记的图片；
+   - 其次选择文件名或 caption 中明确包含 `Figure 1`、`Architecture`、`Framework`、`Overview`、`Pipeline`、`Model Structure` 的图片；
+   - **如果没有符合以上标准的图片，禁止强行把数据示例图、地图、实验结果图当作总流程图。必须在第一部分明确说明“论文未提供可解析的总体架构图”，只用文字描述核心框架。**
 2. **再看公式**：从 `formulas` 列表中挑选 2-4 个**最核心的数学公式**（通常是目标函数、模型关键方程、损失函数等）。
 3. **然后写文章**：按下面两大部分组织，第一部分围绕总流程图讲创新点+实验效果，第二部分围绕公式讲方法细节。
 
@@ -950,21 +1013,23 @@ def generate_single_article(selected: tuple[float, dict, str, dict], top10: list
 # ── 通知推送抽象层 ──
 
 def markdown_to_text(markdown_text: str) -> str:
-    """把 Markdown 转成适合微信群阅读的纯文本"""
+    """把 Markdown 转成适合微信群/通知渠道阅读的纯文本，尽量保留图片链接和公式内容"""
     text = markdown_text
-    # 移除图片引用，保留链接文本
-    text = re.sub(r"!\[(.*?)\]\(.*?\)", r"[图:\1]", text)
-    # 把链接转成 文本(url) 形式
+    # 保留图片链接：图注 + URL
+    text = re.sub(r"!\[(.*?)\]\((.*?)\)", r"[图: \1]\n链接: \2", text)
+    # 把普通链接转成 文本(url) 形式
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1(\2)", text)
     # 移除加粗、斜体标记
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"\*(.*?)\*", r"\1", text)
     text = re.sub(r"_(.*?)_", r"\1", text)
-    # 代码块简化
+    # 代码块简化，但保留公式块内容
     text = re.sub(r"```[\s\S]*?```", "[代码块]", text)
     text = re.sub(r"`(.*?)`", r"\1", text)
-    # 标题前面加换行和 # 号提示
+    # LaTeX 公式块保留为文本，前面加标记
+    text = re.sub(r"\$\$(.*?)\$\$", r"[公式]\n\1\n[/公式]", text, flags=re.DOTALL)
+    # 标题前面加换行和书名号提示
     text = re.sub(r"^#{1,6}\s+(.*)$", r"\n【\1】", text, flags=re.MULTILINE)
     # 列表符号统一
     text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
