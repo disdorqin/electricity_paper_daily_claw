@@ -16,13 +16,23 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
+WEBHOOK_ENV_NAMES = [
+    "WECHAT_WEBHOOK",
+    "WECOM_WEBHOOK",
+    "WECHAT_BOT_WEBHOOK",
+    "WECHAT_ROBOT_WEBHOOK",
+    "QYWX_WEBHOOK",
+    "ENTERPRISE_WECHAT_WEBHOOK",
+]
+
 ARXIV_QUERIES = [
-    "all:(electricity load forecasting)",
-    "all:(peak demand forecasting)",
-    "all:(power load forecasting)",
-    "all:(probabilistic forecasting electricity)",
-    "all:(time series forecasting mamba)",
-    "all:(transformer time series forecasting)",
+    "all:electricity AND all:load AND all:forecasting",
+    "all:power AND all:load AND all:forecasting",
+    "all:peak AND all:demand AND all:forecasting",
+    "all:probabilistic AND all:forecasting AND all:electricity",
+    "all:time AND all:series AND all:forecasting AND all:mamba",
+    "all:transformer AND all:time AND all:series AND all:forecasting",
+    "all:PatchTST OR all:iTransformer OR all:Temporal Fusion Transformer",
 ]
 GITHUB_QUERIES = [
     "electricity load forecasting time series",
@@ -31,6 +41,12 @@ GITHUB_QUERIES = [
     "mamba time series forecasting",
     "PatchTST load forecasting",
     "ensemble stacking blending time series forecasting",
+]
+
+REQUIRED_TOPIC_TERMS = [
+    "electricity", "power", "load", "demand", "grid", "energy", "forecast", "forecasting",
+    "time series", "mamba", "patchtst", "itransformer", "temporal fusion", "tft",
+    "probabilistic", "uncertainty", "ensemble", "stacking", "blending", "peak",
 ]
 
 
@@ -51,13 +67,20 @@ def clean(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+def topic_hit(text: str) -> bool:
+    t = text.lower()
+    return any(term in t for term in REQUIRED_TOPIC_TERMS)
+
+
 def score(text: str) -> int:
     t = text.lower()
     weights = {
-        "electricity": 6, "power": 5, "load": 6, "peak": 8, "demand": 5,
-        "forecast": 5, "probabilistic": 6, "uncertainty": 5, "ensemble": 7,
-        "stacking": 7, "blending": 7, "mamba": 5, "transformer": 4,
-        "patchtst": 5, "tft": 4, "temporal fusion": 5,
+        "electricity": 8, "power": 5, "load": 8, "peak": 9, "demand": 7,
+        "grid": 5, "energy": 4, "forecast": 7, "forecasting": 7,
+        "probabilistic": 7, "uncertainty": 6, "ensemble": 8,
+        "stacking": 8, "blending": 8, "mamba": 5, "transformer": 4,
+        "patchtst": 6, "itransformer": 6, "tft": 5, "temporal fusion": 7,
+        "time series": 5,
     }
     return sum(v for k, v in weights.items() if k in t)
 
@@ -70,7 +93,7 @@ def fetch_arxiv(limit: int = 8) -> list[dict]:
             "search_query": q,
             "sortBy": "submittedDate",
             "sortOrder": "descending",
-            "max_results": 5,
+            "max_results": 8,
         })
         try:
             root = ET.fromstring(get(url))
@@ -81,16 +104,21 @@ def fetch_arxiv(limit: int = 8) -> list[dict]:
             link = clean(entry.findtext("a:id", "", ns))
             if not link or link in seen:
                 continue
-            seen.add(link)
             title = clean(entry.findtext("a:title", "", ns))
             summary = clean(entry.findtext("a:summary", "", ns))
+            full_text = title + " " + summary
+            item_score = score(full_text)
+            # Avoid irrelevant fresh arXiv papers from broad queries.
+            if not topic_hit(full_text) or item_score < 12:
+                continue
+            seen.add(link)
             out.append({
                 "type": "paper",
                 "title": title,
                 "url": link,
                 "date": clean(entry.findtext("a:published", "", ns))[:10],
                 "summary": summary[:700],
-                "score": score(title + " " + summary),
+                "score": item_score,
             })
     return sorted(out, key=lambda x: x["score"], reverse=True)[:limit]
 
@@ -105,7 +133,7 @@ def fetch_github(limit: int = 8) -> list[dict]:
             "q": q,
             "sort": "updated",
             "order": "desc",
-            "per_page": 5,
+            "per_page": 6,
         })
         try:
             data = json.loads(get(url, headers))
@@ -116,8 +144,12 @@ def fetch_github(limit: int = 8) -> list[dict]:
             name = repo.get("full_name", "")
             if not name or name in seen:
                 continue
-            seen.add(name)
             desc = clean(repo.get("description") or "")
+            full_text = name + " " + desc
+            item_score = score(full_text)
+            if item_score < 8:
+                continue
+            seen.add(name)
             stars = int(repo.get("stargazers_count") or 0)
             out.append({
                 "type": "repo",
@@ -126,7 +158,7 @@ def fetch_github(limit: int = 8) -> list[dict]:
                 "date": (repo.get("updated_at") or "")[:10],
                 "stars": stars,
                 "summary": desc[:500],
-                "score": score(name + " " + desc) + min(stars // 100, 10),
+                "score": item_score + min(stars // 100, 10),
             })
     return sorted(out, key=lambda x: (x["score"], x.get("stars", 0)), reverse=True)[:limit]
 
@@ -140,7 +172,10 @@ def fallback_digest(papers: list[dict], repos: list[dict]) -> str:
         "",
         "## 今日值得看",
     ]
-    for i, item in enumerate((papers + repos)[:10], 1):
+    items = papers + repos
+    if not items:
+        lines.append("今天没有抓到足够相关的新论文/仓库，建议继续沿用近期实验路线。")
+    for i, item in enumerate(items[:10], 1):
         star = f"，⭐{item.get('stars')}" if item.get("stars") else ""
         lines.append(f"{i}. [{item['title']}]({item['url']})（{item['type']}，{item.get('date','')}{star}）")
         if item.get("summary"):
@@ -209,10 +244,20 @@ def chunks(text: str, limit: int = 3300) -> list[str]:
     return parts
 
 
+def get_wecom_webhook() -> str:
+    for name in WEBHOOK_ENV_NAMES:
+        value = os.getenv(name)
+        if value:
+            print(f"[info] using webhook secret: {name}")
+            return value
+    raise RuntimeError(
+        "Missing WeCom webhook secret. Add one of these GitHub Actions secrets: "
+        + ", ".join(WEBHOOK_ENV_NAMES)
+    )
+
+
 def send_wecom(text: str) -> None:
-    hook = os.getenv("WECHAT_WEBHOOK")
-    if not hook:
-        raise RuntimeError("Missing WECHAT_WEBHOOK secret")
+    hook = get_wecom_webhook()
     parts = chunks(text)
     for i, part in enumerate(parts, 1):
         suffix = f"\n\n> 第 {i}/{len(parts)} 段" if len(parts) > 1 else ""
@@ -222,6 +267,7 @@ def send_wecom(text: str) -> None:
 def main() -> None:
     papers = fetch_arxiv()
     repos = fetch_github()
+    print(f"[info] selected {len(papers)} papers and {len(repos)} repos")
     digest = llm_digest(papers, repos) or fallback_digest(papers, repos)
     print(digest)
     send_wecom(digest)
